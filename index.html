@@ -50,6 +50,19 @@
     font-size: 14px;
   }
   #fileInput { display: none; }
+  .sidenav {
+    position: absolute; top: 50%; transform: translateY(-50%);
+    z-index: 10; width: 44px; height: 68px;
+    background: rgba(40,40,40,0.55); color: #eee;
+    border: 1px solid #555; border-radius: 8px;
+    font-size: 24px; cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    transition: background 0.15s;
+  }
+  .sidenav:hover { background: rgba(70,70,70,0.9); }
+  .sidenav:disabled { opacity: 0; pointer-events: none; }
+  #navPrev { left: -56px; }
+  #navNext { right: -56px; }
   .spacer { flex: 1; }
   #viewer {
     flex: 1;
@@ -105,7 +118,9 @@
     border-radius: 4px; padding: 5px; font-size: 13px; max-width: 160px;
   }
   #rateLabel, #autoLabel { color: #aaa; font-size: 13px; display: flex; align-items: center; gap: 5px; }
+  #rateWrap { display: flex; flex-direction: column; align-items: center; }
   #rate { width: 80px; }
+  #rateMult { font-size: 9px; color: #888; line-height: 1; margin-top: 1px; }
   #speak.speaking { background: #2a6; border-color: #2a6; }
 </style>
 </head>
@@ -113,20 +128,19 @@
   <div id="toolbar">
     <label class="filebtn" for="fileInput">Open PDF</label>
     <input type="file" id="fileInput" accept="application/pdf">
-    <button id="prev" disabled>&larr; Prev</button>
     <input type="number" id="pageInput" min="1" value="1" disabled>
     <span id="pageCount">/ 0</span>
-    <button id="next" disabled>Next &rarr;</button>
     <button id="zoomOut" disabled>&minus;</button>
     <span id="zoomLabel">100%</span>
     <button id="zoomIn" disabled>+</button>
     <span class="spacer"></span>
-    <button id="speak" disabled>&#9654; Read</button>
-    <button id="pause" disabled>&#10073;&#10073;</button>
-    <button id="stop" disabled>&#9632;</button>
+    <button id="speak" disabled title="Play / Pause">&#9654;</button>
     <select id="voice" disabled title="Voice"></select>
     <label id="rateLabel" title="Reading speed (words per minute)">175 wpm
-      <input type="range" id="rate" min="0.5" max="2" step="0.1" value="1" disabled>
+      <span id="rateWrap">
+        <input type="range" id="rate" min="0.5" max="2" step="0.1" value="1" disabled>
+        <span id="rateMult">1x</span>
+      </span>
     </label>
     <label id="autoLabel" title="Auto-advance to next page">
       <input type="checkbox" id="autoAdvance" checked disabled> Auto
@@ -138,6 +152,8 @@
     <div id="pageWrap" style="display:none">
       <canvas id="canvas"></canvas>
       <div id="textLayer"></div>
+      <button id="navPrev" class="sidenav" disabled title="Previous page">&#10094;</button>
+      <button id="navNext" class="sidenav" disabled title="Next page">&#10095;</button>
     </div>
   </div>
 
@@ -150,8 +166,8 @@
     const fileInput = document.getElementById('fileInput');
     const canvas    = document.getElementById('canvas');
     const ctx       = canvas.getContext('2d');
-    const prevBtn   = document.getElementById('prev');
-    const nextBtn   = document.getElementById('next');
+    const navPrev   = document.getElementById('navPrev');
+    const navNext   = document.getElementById('navNext');
     const pageInput = document.getElementById('pageInput');
     const pageCount = document.getElementById('pageCount');
     const zoomIn    = document.getElementById('zoomIn');
@@ -162,11 +178,10 @@
     const pageWrap  = document.getElementById('pageWrap');
     const textLayer = document.getElementById('textLayer');
     const speakBtn  = document.getElementById('speak');
-    const pauseBtn  = document.getElementById('pause');
-    const stopBtn   = document.getElementById('stop');
     const voiceSel  = document.getElementById('voice');
     const rate      = document.getElementById('rate');
     const rateLabel = document.getElementById('rateLabel');
+    const rateMult  = document.getElementById('rateMult');
     const autoAdv   = document.getElementById('autoAdvance');
     const status    = document.getElementById('status');
 
@@ -183,6 +198,7 @@
 
     const synth = window.speechSynthesis;
     let speaking = false;
+    let paused = false;
     let voices = [];
     let curSpanIdx = -1;
     let speakGen = 0;   // bumped on every stop/restart; stale closures bail
@@ -291,8 +307,8 @@
       num = Math.max(1, Math.min(pdfDoc.numPages, num));
       pageNum = num;
       pageInput.value = num;
-      prevBtn.disabled = num <= 1;
-      nextBtn.disabled = num >= pdfDoc.numPages;
+      navPrev.disabled = num <= 1;
+      navNext.disabled = num >= pdfDoc.numPages;
       viewer.scrollTop = 0;
       queueRender(num);
       if (!keepSpeaking) stopSpeak();
@@ -399,7 +415,7 @@
           clearHlTimer();
           hlTimer = setInterval(() => {
             if (gen !== speakGen || boundaryLive) { clearHlTimer(); return; }
-            if (synth.paused) { t0 += 60; return; }   // freeze while paused
+            if (paused) { t0 += 60; return; }   // freeze while paused
             const ci = Math.min(totalChars, (performance.now() - t0) * charsPerMs);
             highlightAt(c.base + ci);
           }, 60);
@@ -432,8 +448,8 @@
       synth.cancel();
       speakGen++;
       speaking = true;
-      speakBtn.classList.add('speaking');
-      pauseBtn.disabled = stopBtn.disabled = false;
+      paused = false;
+      updateSpeakBtn();
       speakPage(speakGen, startChar || 0);
     }
 
@@ -447,13 +463,25 @@
 
     function stopSpeak() {
       speaking = false;
+      paused = false;
       speakGen++;   // invalidate any in-flight chunk chain
       clearHlTimer();
       synth.cancel();
       clearHighlight();
-      speakBtn.classList.remove('speaking');
-      pauseBtn.disabled = stopBtn.disabled = true;
-      pauseBtn.textContent = '❙❙';
+      updateSpeakBtn();
+    }
+
+    // one button: play when idle, pause while speaking, resume while paused.
+    // track paused ourselves — synth.paused is unreliable on some engines.
+    function updateSpeakBtn() {
+      const playing = speaking && !paused;
+      speakBtn.textContent = playing ? '❙❙' : '▶';
+      speakBtn.classList.toggle('speaking', speaking);
+    }
+    function togglePlay() {
+      if (!speaking) startSpeak();
+      else if (paused) { synth.resume(); paused = false; updateSpeakBtn(); }
+      else { synth.pause(); paused = true; updateSpeakBtn(); }
     }
 
     async function loadPdf(data) {
@@ -476,8 +504,8 @@
       loadPdf(url);
     });
 
-    prevBtn.addEventListener('click', () => goTo(pageNum - 1));
-    nextBtn.addEventListener('click', () => goTo(pageNum + 1));
+    navPrev.addEventListener('click', () => goTo(pageNum - 1));
+    navNext.addEventListener('click', () => goTo(pageNum + 1));
     pageInput.addEventListener('change', () => goTo(parseInt(pageInput.value, 10) || 1));
 
     zoomIn.addEventListener('click', () => {
@@ -491,13 +519,7 @@
       queueRender(pageNum);
     });
 
-    speakBtn.addEventListener('click', startSpeak);
-    stopBtn.addEventListener('click', stopSpeak);
-    pauseBtn.addEventListener('click', () => {
-      if (!speaking) return;
-      if (synth.paused) { synth.resume(); pauseBtn.textContent = '❙❙'; }
-      else { synth.pause(); pauseBtn.textContent = '▶'; }
-    });
+    speakBtn.addEventListener('click', togglePlay);
     const BASE_WPM = 175;   // fallback estimate before we have a measurement
     function setWpmLabel(n) { rateLabel.childNodes[0].nodeValue = Math.round(n) + ' wpm '; }
 
@@ -516,8 +538,13 @@
       return wpmEma != null ? wpmEma * (r / wpmRate) : r * BASE_WPM;
     }
 
+    function setMultLabel(r) {
+      rateMult.textContent = (Number.isInteger(r) ? r : r.toFixed(1)) + 'x';
+    }
     rate.addEventListener('input', () => {
-      setWpmLabel(predictWpm(parseFloat(rate.value)));
+      const r = parseFloat(rate.value);
+      setWpmLabel(predictWpm(r));
+      setMultLabel(r);
     });
 
     voiceSel.addEventListener('change', () => {
@@ -544,7 +571,7 @@
       if (e.target === pageInput) return;
       if (e.key === 'ArrowRight' || e.key === 'PageDown') goTo(pageNum + 1);
       if (e.key === 'ArrowLeft'  || e.key === 'PageUp')   goTo(pageNum - 1);
-      if (e.key === ' ') { e.preventDefault(); speaking ? stopSpeak() : startSpeak(); }
+      if (e.key === ' ') { e.preventDefault(); togglePlay(); }
     });
 
     // stop speech if tab closed/reloaded (some browsers keep speaking)
