@@ -17,6 +17,7 @@
     flex-direction: column;
   }
   #toolbar {
+    position: relative;
     display: flex;
     align-items: center;
     gap: 10px;
@@ -103,6 +104,22 @@
     border-radius: 2px;
     color: transparent;
   }
+  #txtView {
+    display: none;
+    background: #fff;
+    color: #111;
+    padding: 48px 56px;
+    width: 720px;
+    max-width: 100%;
+    font-size: 18px;
+    line-height: 1.6;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    font-family: Georgia, 'Times New Roman', serif;
+  }
+  #txtView span { cursor: pointer; border-radius: 2px; }
+  #txtView span:hover { background: rgba(120, 170, 255, 0.30); }
+  #txtView span.reading { background: rgba(255, 214, 0, 0.55); }
   #empty {
     margin: auto;
     text-align: center;
@@ -110,6 +127,10 @@
   }
   #status {
     color: #f88; font-size: 13px;
+  }
+  #pageGroup {
+    position: absolute; left: 50%; transform: translateX(-50%);
+    display: flex; align-items: center; gap: 10px;
   }
   #pageCount { color: #aaa; font-size: 14px; }
   #zoomLabel { color: #aaa; font-size: 14px; min-width: 42px; text-align: center; }
@@ -121,25 +142,37 @@
   #rateWrap { display: flex; flex-direction: column; align-items: center; }
   #rate { width: 80px; }
   #rateMult { font-size: 9px; color: #888; line-height: 1; margin-top: 1px; }
+  #speak {
+    position: fixed; top: 54px; left: 50%; transform: translateX(-50%);
+    z-index: 20; width: 52px; height: 52px; border-radius: 50%;
+    background: #444; color: #eee; border: 1px solid #555;
+    font-size: 20px; cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+    transition: background 0.15s;
+  }
+  #speak:hover { background: #555; }
+  #speak:disabled { opacity: 0; pointer-events: none; }
   #speak.speaking { background: #2a6; border-color: #2a6; }
 </style>
 </head>
 <body>
   <div id="toolbar">
-    <label class="filebtn" for="fileInput">Open PDF</label>
-    <input type="file" id="fileInput" accept="application/pdf">
-    <input type="number" id="pageInput" min="1" value="1" disabled>
-    <span id="pageCount">/ 0</span>
+    <label class="filebtn" for="fileInput">Open File</label>
+    <input type="file" id="fileInput" accept="application/pdf,text/plain,.txt">
     <button id="zoomOut" disabled>&minus;</button>
-    <span id="zoomLabel">100%</span>
+    <span id="zoomLabel">150%</span>
     <button id="zoomIn" disabled>+</button>
+    <div id="pageGroup">
+      <input type="number" id="pageInput" min="1" value="1" disabled>
+      <span id="pageCount">/ 0</span>
+    </div>
     <span class="spacer"></span>
-    <button id="speak" disabled title="Play / Pause">&#9654;</button>
     <select id="voice" disabled title="Voice"></select>
     <label id="rateLabel" title="Reading speed (words per minute)">175 wpm
       <span id="rateWrap">
-        <input type="range" id="rate" min="0.5" max="2" step="0.1" value="1" disabled>
-        <span id="rateMult">1x</span>
+        <input type="range" id="rate" min="0.5" max="2" step="0.1" value="1.4" disabled>
+        <span id="rateMult">1.4x</span>
       </span>
     </label>
     <label id="autoLabel" title="Auto-advance to next page">
@@ -148,10 +181,12 @@
     <span id="status"></span>
   </div>
   <div id="viewer">
-    <div id="empty">Open a PDF to start reading.</div>
+    <button id="speak" disabled title="Play / Pause">&#9654;</button>
+    <div id="empty">Open a PDF or .txt file to start reading.</div>
     <div id="pageWrap" style="display:none">
       <canvas id="canvas"></canvas>
       <div id="textLayer"></div>
+      <div id="txtView"></div>
       <button id="navPrev" class="sidenav" disabled title="Previous page">&#10094;</button>
       <button id="navNext" class="sidenav" disabled title="Next page">&#10095;</button>
     </div>
@@ -177,6 +212,7 @@
     const viewer    = document.getElementById('viewer');
     const pageWrap  = document.getElementById('pageWrap');
     const textLayer = document.getElementById('textLayer');
+    const txtView   = document.getElementById('txtView');
     const speakBtn  = document.getElementById('speak');
     const voiceSel  = document.getElementById('voice');
     const rate      = document.getElementById('rate');
@@ -186,8 +222,11 @@
     const status    = document.getElementById('status');
 
     let pdfDoc = null;
+    let mode = 'pdf';       // 'pdf' | 'txt'
+    let txtPages = [];      // array of page strings when mode === 'txt'
+    let txtFont = 18;       // txt font size (px), driven by zoom buttons
     let pageNum = 1;
-    let scale = 1.2;
+    let scale = 1.8;
     let rendering = false;
     let pendingPage = null;
     let lastRendered = 0;   // page number whose canvas+text layer are ready
@@ -297,7 +336,37 @@
       }
     }
 
+    // Render a plain-text page: build visible word spans + the spoken string,
+    // reusing the same spans/pageText model the PDF text layer uses so speech
+    // and highlight logic work unchanged.
+    function renderTxtPage(num) {
+      txtView.innerHTML = '';
+      spans = [];
+      curSpanIdx = -1;
+      const page = txtPages[num - 1] || '';
+      let text = '';
+      // split keeping whitespace so original layout + char offsets are preserved
+      for (const part of page.split(/(\s+)/)) {
+        if (!part) continue;
+        if (/^\s+$/.test(part)) {
+          txtView.appendChild(document.createTextNode(part));
+          text += part;
+        } else {
+          const el = document.createElement('span');
+          el.textContent = part;
+          const start = text.length;
+          text += part;
+          spans.push({ el, start, end: text.length });
+          txtView.appendChild(el);
+        }
+      }
+      pageText = text;
+      txtView.style.fontSize = txtFont + 'px';
+      lastRendered = num;
+    }
+
     function queueRender(num) {
+      if (mode === 'txt') { renderTxtPage(num); return; }
       if (rendering) pendingPage = num;
       else renderPage(num);
     }
@@ -335,16 +404,37 @@
     // split pageText into sentence chunks with their base char offset.
     // Chunking avoids Chrome's ~15s single-utterance cutoff and keeps
     // boundary offsets small/accurate.
+    // PDF: a newline ends a chunk (pdf.js joins with spaces, so \n is rare/real).
+    // TXT: hard-wrapped lines carry mid-sentence \n, so a lone newline is NOT a
+    // break — only .!? and blank-line paragraph breaks split a chunk.
     function chunkPage() {
+      const t = pageText;
+      const isTxt = mode === 'txt';
       const chunks = [];
-      const re = /[^.!?\n]*[.!?\n]+|\S[^.!?\n]*$/g;
-      let m;
-      while ((m = re.exec(pageText)) !== null) {
-        const s = m[0];
-        if (s.trim()) chunks.push({ text: s, base: m.index });
-        if (m.index === re.lastIndex) re.lastIndex++; // guard zero-width
+      let start = 0;
+      const push = (end) => {
+        const s = t.slice(start, end);
+        if (s.trim()) chunks.push({ text: s, base: start });
+        start = end;
+      };
+      let i = 0;
+      while (i < t.length) {
+        const ch = t[i];
+        if (ch === '.' || ch === '!' || ch === '?' || (!isTxt && ch === '\n')) {
+          let j = i + 1;
+          while (j < t.length && '.!?'.indexOf(t[j]) >= 0) j++; // eat "?!" runs
+          push(j); i = j; continue;
+        }
+        if (isTxt && ch === '\n') {   // paragraph break = 2+ newlines in a ws run
+          let j = i + 1, nl = 1;
+          while (j < t.length && /\s/.test(t[j])) { if (t[j] === '\n') nl++; j++; }
+          if (nl >= 2) { push(j); i = j; continue; }
+          i++; continue;             // lone newline -> stays inside the chunk
+        }
+        i++;
       }
-      if (!chunks.length && pageText.trim()) chunks.push({ text: pageText, base: 0 });
+      if (start < t.length) push(t.length);
+      if (!chunks.length && t.trim()) chunks.push({ text: t, base: 0 });
       return chunks;
     }
 
@@ -397,7 +487,9 @@
         curChar = c.base;
         const words = (c.text.match(/\S+/g) || []).length;
         const totalChars = c.text.length;
-        const u = new SpeechSynthesisUtterance(c.text);
+        // swap newlines/tabs for spaces so engines don't pause on them;
+        // 1:1 replace keeps length == totalChars, so boundary offsets align
+        const u = new SpeechSynthesisUtterance(c.text.replace(/[\n\t]/g, ' '));
         if (v) u.voice = v;
         const r = parseFloat(rate.value);
         u.rate = r;
@@ -454,12 +546,14 @@
     }
 
     // click a word -> (re)start reading from that word
-    textLayer.addEventListener('click', (e) => {
+    function wordClick(e) {
       const el = e.target.closest('span');
       if (!el) return;
       const sp = spans.find(s => s.el === el);
       if (sp) startSpeak(sp.start);
-    });
+    }
+    textLayer.addEventListener('click', wordClick);
+    txtView.addEventListener('click', wordClick);
 
     function stopSpeak() {
       speaking = false;
@@ -484,8 +578,7 @@
       else { synth.pause(); paused = true; updateSpeakBtn(); }
     }
 
-    async function loadPdf(data) {
-      pdfDoc = await pdfjsLib.getDocument(data).promise;
+    function enableControls() {
       pageNum = 1;
       pageInput.disabled = false;
       pageInput.max = pdfDoc.numPages;
@@ -494,26 +587,83 @@
       speakBtn.disabled = voiceSel.disabled = rate.disabled = autoAdv.disabled = false;
       empty.style.display = 'none';
       pageWrap.style.display = 'block';
+    }
+
+    async function loadPdf(data) {
+      stopSpeak();
+      mode = 'pdf';
+      pdfDoc = await pdfjsLib.getDocument(data).promise;
+      // pdf mode: show canvas + transparent text layer, hide txt view
+      canvas.style.display = textLayer.style.display = 'block';
+      txtView.style.display = 'none';
+      zoomLabel.textContent = Math.round(scale / 1.2 * 100) + '%';
+      enableControls();
+      goTo(1);
+    }
+
+    // paginate raw text so pages stay a sensible reading length
+    function paginateTxt(text, perPage = 2500) {
+      const pages = [];
+      // prefer breaking on blank lines (paragraphs), fall back to size
+      const paras = text.split(/\n{2,}/);
+      let buf = '';
+      for (const p of paras) {
+        if (buf && buf.length + p.length > perPage) { pages.push(buf); buf = ''; }
+        buf += (buf ? '\n\n' : '') + p;
+        while (buf.length > perPage) {   // single huge paragraph -> hard split
+          pages.push(buf.slice(0, perPage));
+          buf = buf.slice(perPage);
+        }
+      }
+      if (buf.trim()) pages.push(buf);
+      return pages.length ? pages : [''];
+    }
+
+    function loadTxt(text) {
+      stopSpeak();
+      mode = 'txt';
+      txtPages = paginateTxt(text);
+      pdfDoc = { numPages: txtPages.length };   // fake doc: only numPages is read in txt mode
+      // txt mode: show visible text view, hide canvas + pdf text layer
+      canvas.style.display = textLayer.style.display = 'none';
+      txtView.style.display = 'block';
+      pageWrap.style.width = '';
+      pageWrap.style.height = '';
+      zoomLabel.textContent = Math.round(txtFont / 18 * 100) + '%';
+      enableControls();
       goTo(1);
     }
 
     fileInput.addEventListener('change', (e) => {
       const file = e.target.files[0];
       if (!file) return;
-      const url = URL.createObjectURL(file);
-      loadPdf(url);
+      const isTxt = file.type === 'text/plain' || /\.txt$/i.test(file.name);
+      if (isTxt) {
+        file.text().then(loadTxt).catch(() => {
+          status.textContent = 'Could not read text file.';
+        });
+      } else {
+        loadPdf(URL.createObjectURL(file));
+      }
     });
 
     navPrev.addEventListener('click', () => goTo(pageNum - 1));
     navNext.addEventListener('click', () => goTo(pageNum + 1));
     pageInput.addEventListener('change', () => goTo(parseInt(pageInput.value, 10) || 1));
 
+    function zoomTxt(delta) {
+      txtFont = Math.max(10, Math.min(40, txtFont + delta));
+      txtView.style.fontSize = txtFont + 'px';
+      zoomLabel.textContent = Math.round(txtFont / 18 * 100) + '%';
+    }
     zoomIn.addEventListener('click', () => {
+      if (mode === 'txt') { zoomTxt(2); return; }
       scale = Math.min(4, scale + 0.2);
       zoomLabel.textContent = Math.round(scale / 1.2 * 100) + '%';
       queueRender(pageNum);
     });
     zoomOut.addEventListener('click', () => {
+      if (mode === 'txt') { zoomTxt(-2); return; }
       scale = Math.max(0.4, scale - 0.2);
       zoomLabel.textContent = Math.round(scale / 1.2 * 100) + '%';
       queueRender(pageNum);
