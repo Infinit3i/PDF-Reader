@@ -38,6 +38,81 @@ let lastRendered = 0;   // page number whose canvas+text layer are ready
 // per-page text model built during render, reused for speech + highlight
 let pageText = '';          // full spoken string for current page
 let spans = [];             // [{el, start, end}] char range each span covers
+let codeRanges = [];        // [[start,end]] char ranges flagged as code (txt mode)
+
+// heuristic: does this raw line look like source code? (no fences in .txt)
+// tuned against Phrack prose — English keywords/citations/emphasis must NOT trip it,
+// so only real code *shapes* match; loose gaps are filled by block-smoothing below.
+function isCodeLine(line) {
+  const t = line.trim();
+  if (t.length < 2) return false;
+  if (/^[=|~*_+\-\s#.]+$/.test(t)) return false;                  // banner / rule / decoration
+  if (/^#\s*(include|define|ifn?def|endif|pragma|if|else|error)\b/.test(t)) return true; // preprocessor
+  if (/^(\/\/|\/\*|\*\/)/.test(t)) return true;                   // C comment line
+  if (/[;{]\s*$/.test(t) && (/=/.test(t) || /\w\([^)]*\)/.test(t))) return true; // stmt: ends ;/{ + assign/call
+  if (/^[{}]\s*$/.test(t)) return true;                           // lone brace
+  if (/^(if|for|while|switch|do|else)\b[^A-Za-z]*[({]/.test(t)) return true;     // control kw + paren/brace
+  if (/^[\w.>*&\[\]-]*\w+\([^)]*\)\s*;?\s*$/.test(t)) return true;// whole line is a call
+  return false;
+}
+
+// per-line code flags, shared by codeRanges (speech) and DOM (rendering).
+// three signals, in order:
+//  1. fence blocks — Phrack wraps verbatim listings in full-width ----- rules.
+//     a fence opens a block only if its next content line is verbatim (shell $,
+//     (...), or a code shape); everything to the closing fence is code, so
+//     shapeless output lines (`result ... 0x42, time: 495`) get captured too.
+//     fences that merely border prose don't open a block.
+//  3. block-smoothing — a lone non-blank line between two code lines is code too.
+function computeCode(lines) {
+  const n = lines.length;
+  // "verbatim start" signals: code shape, shell prompt, or an elision marker
+  const strong = lines.map(l => isCodeLine(l) || /^\s*\$\s/.test(l) || l.trim() === '(...)');
+  const fence  = lines.map(l => /^-{20,}$/.test(l.trim()));
+  const code = new Array(n).fill(false);
+  let i = 0;
+  while (i < n) {
+    if (fence[i]) {
+      let j = i + 1;
+      while (j < n && !lines[j].trim()) j++;      // next non-blank line
+      if (j < n && !fence[j] && strong[j]) {       // opening fence
+        let k = j;
+        while (k < n && !fence[k]) k++;            // scan to closing fence
+        for (let x = i; x <= Math.min(k, n - 1); x++) code[x] = true;
+        i = k < n ? k + 1 : k;
+        continue;
+      }
+    }
+    if (strong[i]) code[i] = true;
+    i++;
+  }
+  const out = code.slice();
+  for (let x = 1; x < n - 1; x++) {
+    if (!out[x] && lines[x].trim() && code[x - 1] && code[x + 1]) out[x] = true;
+  }
+  return out;
+}
+
+// char offsets of code lines within a txt page (== offsets in pageText)
+function buildCodeRanges(lines, code) {
+  const ranges = [];
+  let off = 0;
+  for (let i = 0; i < lines.length; i++) {
+    if (code[i]) ranges.push([off, off + lines[i].length]);
+    off += lines[i].length + 1;   // + the \n
+  }
+  return ranges;
+}
+
+// fraction of [base,end) that falls inside a code range
+function codeOverlap(base, end) {
+  let cov = 0;
+  for (const [s, e] of codeRanges) {
+    const a = Math.max(base, s), b = Math.min(end, e);
+    if (b > a) cov += b - a;
+  }
+  return cov / Math.max(1, end - base);
+}
 
 const synth = window.speechSynthesis;
 let speaking = false;
@@ -74,6 +149,7 @@ async function renderPage(num) {
   await buildTextLayer(page, viewport);
   lastRendered = num;
   rendering = false;
+  positionNav();
   if (pendingPage !== null) {
     const p = pendingPage; pendingPage = null;
     renderPage(p);
@@ -148,26 +224,66 @@ function renderTxtPage(num) {
   spans = [];
   curSpanIdx = -1;
   const page = txtPages[num - 1] || '';
+  const lines = page.split('\n');
+  const code = computeCode(lines);
+  codeRanges = buildCodeRanges(lines, code);
   let text = '';
-  // split keeping whitespace so original layout + char offsets are preserved
-  for (const part of page.split(/(\s+)/)) {
-    if (!part) continue;
-    if (/^\s+$/.test(part)) {
-      txtView.appendChild(document.createTextNode(part));
-      text += part;
+  // walk line by line; consecutive code lines collapse into one <pre> block,
+  // prose lines become clickable word spans. text mirrors page exactly so
+  // char offsets (codeRanges, spans, highlight) stay aligned.
+  let i = 0;
+  while (i < lines.length) {
+    if (code[i]) {
+      const parts = [];
+      while (i < lines.length && code[i]) {
+        parts.push(lines[i]);
+        text += lines[i];
+        i++;
+        if (i < lines.length) text += '\n';
+      }
+      const pre = document.createElement('pre');
+      pre.className = 'codeblock';
+      pre.textContent = parts.join('\n');
+      txtView.appendChild(pre);
     } else {
-      const el = document.createElement('span');
-      el.textContent = part;
-      const start = text.length;
-      text += part;
-      spans.push({ el, start, end: text.length });
-      txtView.appendChild(el);
+      for (const part of lines[i].split(/(\s+)/)) {
+        if (!part) continue;
+        if (/^\s+$/.test(part)) {
+          txtView.appendChild(document.createTextNode(part));
+          text += part;
+        } else {
+          const el = document.createElement('span');
+          el.textContent = part;
+          const start = text.length;
+          text += part;
+          spans.push({ el, start, end: text.length });
+          txtView.appendChild(el);
+        }
+      }
+      i++;
+      if (i < lines.length) {
+        txtView.appendChild(document.createTextNode('\n'));
+        text += '\n';
+      }
     }
   }
   pageText = text;
   txtView.style.fontSize = txtFont + 'px';
   lastRendered = num;
+  positionNav();
 }
+
+// keep nav arrows hugging the doc's side edges (like -56px) while staying
+// vertically fixed to the viewport. doc is centered + width varies, so measure.
+function positionNav() {
+  if (pageWrap.style.display === 'none') return;
+  const r = pageWrap.getBoundingClientRect();
+  navPrev.style.left  = Math.max(4, r.left - 56) + 'px';
+  navNext.style.left  = Math.min(window.innerWidth - 48, r.right + 12) + 'px';
+  navNext.style.right = 'auto';
+}
+window.addEventListener('resize', positionNav);
+viewer.addEventListener('scroll', positionNav);
 
 function queueRender(num) {
   if (mode === 'txt') { renderTxtPage(num); return; }
@@ -218,7 +334,10 @@ function chunkPage() {
   let start = 0;
   const push = (end) => {
     const s = t.slice(start, end);
-    if (s.trim()) chunks.push({ text: s, base: start });
+    // txt: drop chunks that are mostly code so TTS skips them
+    if (s.trim() && !(isTxt && codeOverlap(start, end) > 0.5)) {
+      chunks.push({ text: s, base: start });
+    }
     start = end;
   };
   let i = 0;
@@ -296,6 +415,11 @@ function speakPage(gen, startChar) {
     // all 1:1 replaces keep length == totalChars, so boundary offsets align
     let spoken = c.text.replace(/[\n\t]/g, ' ');
     if (mode === 'txt') spoken = spoken.replace(/-{3,}/g, m => ' '.repeat(m.length));
+    // silence long gibberish tokens (hashes/hex/base64/ids) — no point reading them.
+    // 16+ chars that are all-hex or mix letters+digits; normal long words are kept.
+    spoken = spoken.replace(/[A-Za-z0-9+/=]{16,}/g, m =>
+      (/^[0-9a-fA-F]+$/.test(m) || (/[A-Za-z]/.test(m) && /\d/.test(m)))
+        ? ' '.repeat(m.length) : m);
     const u = new SpeechSynthesisUtterance(spoken);
     if (v) u.voice = v;
     const r = parseFloat(rate.value);
