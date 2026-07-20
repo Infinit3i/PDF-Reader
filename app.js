@@ -292,8 +292,11 @@ function speakPage(gen, startChar) {
     const words = (c.text.match(/\S+/g) || []).length;
     const totalChars = c.text.length;
     // swap newlines/tabs for spaces so engines don't pause on them;
-    // 1:1 replace keeps length == totalChars, so boundary offsets align
-    const u = new SpeechSynthesisUtterance(c.text.replace(/[\n\t]/g, ' '));
+    // txt: silence runs of 3+ dashes (divider lines) so TTS doesn't say "dash dash..."
+    // all 1:1 replaces keep length == totalChars, so boundary offsets align
+    let spoken = c.text.replace(/[\n\t]/g, ' ');
+    if (mode === 'txt') spoken = spoken.replace(/-{3,}/g, m => ' '.repeat(m.length));
+    const u = new SpeechSynthesisUtterance(spoken);
     if (v) u.voice = v;
     const r = parseFloat(rate.value);
     u.rate = r;
